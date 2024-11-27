@@ -2,6 +2,17 @@
 
 import copy
 import os
+from typing import List, Optional, Tuple, Union
+import torch
+from torch import nn
+from transformers import MistralForCausalLM
+from transformers.modeling_outputs import CausalLMOutputWithPast
+import cairosvg
+from PIL import Image
+import io
+from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+import clip
 import yaml
 import json
 import datetime
@@ -14,7 +25,12 @@ from transformers import Trainer, set_seed
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, PeftModel
 from utils.initialization_utils import find_and_initialize
-
+from transformers import AutoModelForCausalLM, AutoConfig
+import torch
+import torch.nn as nn
+from transformers import MistralForCausalLM, MistralConfig
+from transformers import Cache
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 IGNORE_INDEX = -100
 PROMPT = (
@@ -22,23 +38,23 @@ PROMPT = (
     "Write a response that appropriately completes the request.\n\n"
     "### Instruction:\n{instruction}\n\n### Response:"
 )
-
+clip_model, clip_preprocess = clip.load("ViT-B/32", device="cuda")
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    model_name_or_path: Optional[str] = field(default="/home/liuzhe/new-files/AI-ModelScope/Mistral-7B-v0___1")
     adapter_name_or_path: Optional[str] = field(default=None)
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_path: str = field(default="/home/liuzhe/new-files/LoRA-XS/utils/dataset-1024-everypath-9-7.json", metadata={"help": "Path to the training data."})
     dataset_split: str = field(
-        default="train[:100000]", metadata={"help": "(`['train', 'test', 'eval']`):"}
+        default="train", metadata={"help": "(`['train', 'test', 'eval']`):"}
     )
     dataset_field: List[str] = field(
-        default=None, metadata={"help": "Fields of dataset input and output."}
+        default="caption code", metadata={"help": "Fields of dataset input and output."}
     )
     optim: str = field(default="adamw_torch")
-    model_max_length: int = field(default=512, metadata={
+    model_max_length: int = field(default=2048, metadata={
         "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."}, )
-    lora_r: int = field(default=None, metadata={
+    lora_r: int = field(default=128, metadata={
         "help": "The rank of the low-rank adapter."})
 
 
@@ -64,6 +80,8 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
         for text in strings
     ]
     input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    # print('tokenizerd:',tokenizer.decode(labels))
+
     input_ids_lens = labels_lens = [
         tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
     ]
@@ -109,6 +127,7 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
+    
 
 
 def train_tokenize_function(examples, tokenizer, query, response):
@@ -118,16 +137,159 @@ def train_tokenize_function(examples, tokenizer, query, response):
     return data_dict
 
 
+class CustomMistralForCausalLM(MistralForCausalLM):
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+        hidden_states = outputs[0]
+        # print("Hidden states size:", hidden_states.shape)
+
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # TODO: remove the float() operation in v4.46
+        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
+
+        loss = None
+        if labels is not None:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                '/home/liuzhe/new-files/AI-ModelScope/Mistral-7B-v0___1',
+                model_max_length=2048,
+                padding_side="right",
+                use_fast=True,
+            )
+                # 创建一个新变量，过滤掉 -100
+            filtered_labels = [label for label in labels.tolist()[0] if label != -100]
+
+
+                # print("input_ids",print(input_ids))
+            svg_text = tokenizer.decode(filtered_labels).replace('</s>',"")
+            # print("label","svg_text")
+            # input_id_decode = tokenizer.decode(f_input_ids).replace('</s>',"")
+            # print("Input",input_id_decode)
+            png_data = cairosvg.svg2png(bytestring=svg_text)
+            # Create an image from the PNG data
+            image = Image.open(io.BytesIO(png_data))
+            # Create a new image with a light gray background
+            background = Image.new('RGB', image.size, (240, 240, 240))  # Light gray color
+            background.paste(image, (0, 0), image)
+            # Save the final image as JPG
+            background.save('/home/liuzhe/new-files/LoRA-XS/utils/output_image1.jpg', 'JPEG')
+
+            # 2. 加载并预处理图像
+            image = clip_preprocess(Image.open("/home/liuzhe/new-files/LoRA-XS/utils/output_image1.jpg")).unsqueeze(0).to("cuda")
+
+            # Encode the image to get the image features
+            with torch.no_grad():
+                image_embeddings = clip_model.encode_image(image)
+
+#           获得svg last_hidden_state
+            svg_inputs = tokenizer(svg_text, return_tensors="pt").to("cuda")
+
+            with torch.no_grad():
+                outputs = self.model(**svg_inputs)
+
+            last_hidden_states = outputs.last_hidden_state
+
+            def cosine_similarity(a, b):
+                if a.device != b.device:
+                    b = b.to(a.device)  # 将 b 移动到 a 的设备上
+                a = a.reshape(-1,512)
+                # 使用 PyTorch 内置函数计算余弦相似度
+                similarity = F.cosine_similarity(a, b, dim=-1)
+
+                return similarity.mean()
+            similarity = cosine_similarity(last_hidden_states,image_embeddings)
+            print("similarity",similarity)
+
+            # Upcast to float if we need to compute the loss to avoid potential precision issues
+            logits = logits.float()
+            # print("Logits:", logits)
+            # print("Labels:", labels)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Ensure tensors are on the same device
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(shift_logits, shift_labels)*0.7+(1-similarity)*0.3
+            # loss = loss_fct(shift_logits, shift_labels)
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+# Now you can use the model for training or inference
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     print(script_args)
-
+    # script_args = TrainingArguments(
+    #     model_name_or_path="/home/liuzhe/new-files/AI-ModelScope/Mistral-7B-v0___1",
+    #     output_dir="output_32",
+    #     lora_r=128,
+    #     data_path="/home/liuzhe/new-files/LoRA-XS/utils/dataset-1024-everypath-9-7.json",
+    #     dataset_split="train[:1]",
+    #     dataset_field=['caption', 'code'],
+    #     num_train_epochs=4,
+    #     per_device_train_batch_size=1,
+    #     gradient_accumulation_steps=1,
+    #     save_strategy="steps",
+    #     save_steps=48,
+    #     save_total_limit=30,
+    #     learning_rate=4e-3,
+    #     weight_decay=0.,
+    #     warmup_ratio=0.02,
+    #     lr_scheduler_type="cosine",
+    #     logging_steps=1,
+    #     bf16=False,
+    #     tf32=False,
+    #     fp16=True,
+    #     report_to="tensorboard"
+    # )
     set_seed(script_args.seed)
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        device_map="auto",
+    model = CustomMistralForCausalLM.from_pretrained(
+        script_args.model_name_or_path, device_map="auto"
     )
 
     if script_args.lora_r is not None:
@@ -164,10 +326,8 @@ def train():
 
     find_and_initialize(model, peft_config_dict, adapter_name=adapter_name, reconstr_type=reconstr_type,
                         writer=None, reconstruct_config=reconstr_config)
-
     for param in model.parameters():
         param.data = param.data.contiguous()
-
     model.print_trainable_parameters()
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         script_args.model_name_or_path,
@@ -176,20 +336,18 @@ def train():
         use_fast=True,
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    raw_train_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split)
+    raw_train_datasets = load_dataset("json",data_files=script_args.data_path,split='train')
+        # remove_columns=raw_train_datasets.column_names,
     train_dataset = raw_train_datasets.map(
         train_tokenize_function,
         batched=True,
-        batch_size=3000,
+        batch_size=1,
         num_proc=32,
-        remove_columns=raw_train_datasets.column_names,
         load_from_cache_file=True,
         desc="Running tokenizer on train dataset",
         fn_kwargs={"tokenizer": tokenizer, "query": script_args.dataset_field[0],
                    "response": script_args.dataset_field[1]}
     )
-
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, data_collator=data_collator)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
@@ -197,7 +355,5 @@ def train():
     trainer.train()
     trainer.save_state()
     model.save_pretrained(os.path.join(script_args.output_dir, 'ft'))
-
-
 if __name__ == "__main__":
     train()

@@ -127,7 +127,7 @@ def gsm8k_test(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_para
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)  # merged model path
-    parser.add_argument("--data_file", type=str, default='data/math_eval/gsm8k_test.jsonl')  # data path
+    parser.add_argument("--data_file", type=str, default='/home/liuzhe/new-files/LoRA-XS/dataset-32-everypath.json')  # data path
     parser.add_argument("--start", type=int, default=0)  # start index
     parser.add_argument("--end", type=int, default=MAX_INT)  # end index
     parser.add_argument("--batch_size", type=int, default=32)  # batch_size

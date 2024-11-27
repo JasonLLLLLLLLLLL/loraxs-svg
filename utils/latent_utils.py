@@ -47,6 +47,94 @@ def get_delta_weight(self, adapter) -> torch.Tensor:
     return output_tensor
 
 
+# def forward_latent(self, x: torch.Tensor):
+#     previous_dtype = x.dtype
+
+#     if self.active_adapter[0] not in self.lora_A.keys():
+#         return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+#     if self.disable_adapters:
+#         if self.r[self.active_adapter[0]] > 0 and self.merged:
+#             self.unmerge()
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+#     elif self.r[self.active_adapter[0]] > 0 and not self.merged:
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+#         x = x.to(self.lora_A[self.active_adapter[0]].weight.dtype)
+
+#         # adding latent_mapping in the forward loop
+#         result += (
+#             self.lora_B[self.active_adapter[0]](
+#                 self.default_lora_latent_mapping(
+#                     self.lora_A[self.active_adapter[0]](self.lora_dropout[self.active_adapter[0]](x))
+#                 )
+#             )
+#             * self.scaling[self.active_adapter[0]]
+#         )
+#     else:
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+#     result = result.to(previous_dtype)
+
+#     return result
+# def forward_latent(self, x: torch.Tensor):
+#     previous_dtype = x.dtype
+
+#     # 如果当前适配器不在 lora_A 的 keys 中，直接返回线性变换结果
+#     if self.active_adapter[0] not in self.lora_A.keys():
+#         return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+    
+#     # 如果禁用了 adapter，且 merged 状态被激活，取消 merge 并返回线性变换结果
+#     if self.disable_adapters:
+#         if self.r[self.active_adapter[0]] > 0 and self.merged:
+#             self.unmerge()
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+#     # 正常的 LoRA 流程
+#     elif self.r[self.active_adapter[0]] > 0 and not self.merged:
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+#         # 确保输入 x 的 dtype 与 lora_A 的权重类型一致
+#         x = x.to(self.lora_A[self.active_adapter[0]].weight.dtype)
+
+#         # 1. 基本的 default_lora_latent_mapping 处理
+#         latent_result = self.default_lora_latent_mapping(
+#             self.lora_A[self.active_adapter[0]](self.lora_dropout[self.active_adapter[0]](x))
+#         )
+
+#         # 通过 lora_B 处理 latent_mapping 结果并缩放
+#         result += (
+#             self.lora_B[self.active_adapter[0]](latent_result)
+#             * self.scaling[self.active_adapter[0]]
+#         )
+
+#         # 2. 多头机制的处理
+#         # 我们定义一个变量来累积所有多头的结果
+#         multihead_result = 0
+#         for head in self.multihead_lora_mappings:
+#             # 多头的处理，每个头都有独立的 A -> Head -> B 流程
+#             head_result = head(
+#                 self.lora_A[self.active_adapter[0]](self.lora_dropout[self.active_adapter[0]](x))
+#             )
+            
+#             # 将每个头的结果通过 lora_B 处理，并加入缩放
+#             multihead_result += (
+#                 self.lora_B[self.active_adapter[0]](head_result)
+#                 * self.scaling[self.active_adapter[0]]
+#             )
+
+#         # # 3. 将所有多头的结果进行平均（也可以改为其他融合方式，如加权和）
+#         # multihead_result /= len(self.multihead_lora_mappings)
+
+#         # 最终将多头的结果加入到 result 中
+#         result += multihead_result
+#         result = result/(len(self.multihead_lora_mappings)+1)
+#     else:
+#         result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+#     # 将结果恢复为原始的 dtype
+#     result = result.to(previous_dtype)
+
+#     return result
+
 def forward_latent(self, x: torch.Tensor):
     previous_dtype = x.dtype
 
