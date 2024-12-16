@@ -136,8 +136,33 @@ def train_tokenize_function(examples, tokenizer, query, response):
     data_dict = preprocess(sources, targets, tokenizer)
     return data_dict
 
-
+def cosine_similarity(a, b):
+    print(a.shape)
+    print(b.shape)
+    if a.device != b.device:
+        b = b.to(a.device)  # Move b to the same device as a
+    # Define a 1D convolutional layer to reduce the feature dimension
+    # Reshape a for convolution: (batch_size, in_channels, sequence_length)
+    # conv1d = nn.Conv1d(in_channels=4096, out_channels=512, kernel_size=1).to(a.device)
+    # a = a.permute(0, 2, 1)  # Change shape to (batch_size, 4096, sequence_length)
+    # a = self.conv1d(a)  # Apply convolution
+    # a = a.permute(0, 2, 1)  # Change shape back to (batch_size, sequence_length, 512)
+    # Compute cosine similarity
+    a = F.normalize(a, p=2, dim=-1)
+    b = F.normalize(b, p=2, dim=-1)
+    similarity = F.cosine_similarity(a, b, dim=-1)
+    return similarity.mean()
 class CustomMistralForCausalLM(MistralForCausalLM):
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Define a 1D convolutional layer
+        # self.clip_linear_layer = nn.Linear(512, 4096)
+        # self.clip_linear_layer = nn.Conv1d(in_channels=4096, out_channels=512, kernel_size=1)
+        self.align_layer= buildMLP(4096,1024,512)
+        # Initialize weights and apply final processing
+        self.post_init()
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -179,7 +204,6 @@ class CustomMistralForCausalLM(MistralForCausalLM):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         # TODO: remove the float() operation in v4.46
         logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
-
         loss = None
         if labels is not None:
             tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -190,10 +214,9 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             )
                 # 创建一个新变量，过滤掉 -100
             filtered_labels = [label for label in labels.tolist()[0] if label != -100]
-
-
                 # print("input_ids",print(input_ids))
             svg_text = tokenizer.decode(filtered_labels).replace('</s>',"")
+
             # print("label","svg_text")
             # input_id_decode = tokenizer.decode(f_input_ids).replace('</s>',"")
             # print("Input",input_id_decode)
@@ -203,39 +226,19 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             # Create a new image with a light gray background
             background = Image.new('RGB', image.size, (240, 240, 240))  # Light gray color
             background.paste(image, (0, 0), image)
-            # Save the final image as JPG
-            background.save('/home/liuzhe/new-files/LoRA-XS/utils/output_image1.jpg', 'JPEG')
-
             # 2. 加载并预处理图像
-            image = clip_preprocess(Image.open("/home/liuzhe/new-files/LoRA-XS/utils/output_image1.jpg")).unsqueeze(0).to("cuda")
-
+            image = clip_preprocess(background).unsqueeze(0).to("cuda")
             # Encode the image to get the image features
-            with torch.no_grad():
-                image_embeddings = clip_model.encode_image(image)
-
+            image_embeddings = clip_model.encode_image(image) 
 #           获得svg last_hidden_state
             svg_inputs = tokenizer(svg_text, return_tensors="pt").to("cuda")
+            svg_hidden_outputs = self.model(**svg_inputs)
+            svg_hidden_states = svg_hidden_outputs.last_hidden_state
 
-            with torch.no_grad():
-                outputs = self.model(**svg_inputs)
-
-            last_hidden_states = outputs.last_hidden_state
-
-            def cosine_similarity(a, b):
-                if a.device != b.device:
-                    b = b.to(a.device)  # 将 b 移动到 a 的设备上
-                a = a.reshape(-1,512)
-                # 使用 PyTorch 内置函数计算余弦相似度
-                similarity = F.cosine_similarity(a, b, dim=-1)
-
-                return similarity.mean()
-            similarity = cosine_similarity(last_hidden_states,image_embeddings)
-            print("similarity",similarity)
-
+            align_hidden_states=self.align_layer(svg_hidden_states)
+            similarity = cosine_similarity(align_hidden_states,image_embeddings)
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
-            # print("Logits:", logits)
-            # print("Labels:", labels)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
@@ -244,8 +247,28 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             # Ensure tensors are on the same device
             shift_labels = shift_labels.to(shift_logits.device)
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits, shift_labels)*0.7+(1-similarity)*0.3
+            loss = loss_fct(shift_logits, shift_labels)*(1-similarity)
             # loss = loss_fct(shift_logits, shift_labels)
+            # batch_size, sequence_length, vocab_size = logits.shape
+            # decoded_outputs = []
+            # for i in range(batch_size):
+            #     decoded_sequence = []
+            #     for j in range(sequence_length):
+            #         # 获取当前时间步的 logits
+            #         current_logits = logits[i, j, :]
+                    
+            #         # 获取预测的 token ID
+            #         predicted_token_id = current_logits.argmax(dim=-1)
+                    
+            #         # 解码为文本
+            #         decoded_token = tokenizer.decode(predicted_token_id, skip_special_tokens=True)
+            #         decoded_sequence.append(decoded_token)
+                
+            #     decoded_outputs.append(decoded_sequence)
+
+            # # 打印解码结果
+            # for i, sequence in enumerate(decoded_outputs):
+            #     print(f"Decoded output for batch {i}: {' '.join(sequence)}")
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -257,7 +280,6 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
 # Now you can use the model for training or inference
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
