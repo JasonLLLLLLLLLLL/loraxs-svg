@@ -1,7 +1,8 @@
 # Code based on https://github.com/GraphPKU/PiSSA script with minimal changes.
-
-import copy
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import threading
+import copy
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
@@ -18,7 +19,7 @@ import json
 import datetime
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence, List, Literal
-
+import peft
 import torch
 import transformers
 from transformers import Trainer, set_seed
@@ -30,7 +31,8 @@ import torch
 import torch.nn as nn
 from transformers import MistralForCausalLM, MistralConfig
 from transformers import Cache
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import concurrent.futures
+import signal
 
 IGNORE_INDEX = -100
 PROMPT = (
@@ -44,7 +46,7 @@ clip_model, clip_preprocess = clip.load("ViT-B/32", device="cuda")
 class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: Optional[str] = field(default="/home/liuzhe/new-files/AI-ModelScope/Mistral-7B-v0___1")
     adapter_name_or_path: Optional[str] = field(default=None)
-    data_path: str = field(default="/home/liuzhe/new-files/LoRA-XS/utils/dataset-1024-everypath-9-7.json", metadata={"help": "Path to the training data."})
+    data_path: str = field(default="", metadata={"help": "Path to the training data."})
     dataset_split: str = field(
         default="train", metadata={"help": "(`['train', 'test', 'eval']`):"}
     )
@@ -148,20 +150,59 @@ def cosine_similarity(a, b):
     # a = self.conv1d(a)  # Apply convolution
     # a = a.permute(0, 2, 1)  # Change shape back to (batch_size, sequence_length, 512)
     # Compute cosine similarity
-    a = F.normalize(a, p=2, dim=-1)
-    b = F.normalize(b, p=2, dim=-1)
+
     similarity = F.cosine_similarity(a, b, dim=-1)
     return similarity.mean()
+
+def get_decoded_svg_content(decoded_output: str) -> str:
+    """
+    提取字符串中第一个以 <svg> 开头和 </svg> 结尾的内容。
+
+    :param decoded_output: 输入的字符串
+    :return: 第一个 SVG 内容，如果未找到则返回空字符串
+    """
+    # 查找第一个 <svg> 和 </svg> 的位置
+    start_index = decoded_output.find('<svg')
+    end_index = decoded_output.find('</svg>', start_index)
+
+    # 提取内容
+    if start_index != -1 and end_index != -1:
+        svg_content = decoded_output[start_index:end_index + len('</svg>')]
+        return svg_content.strip()
+    
+    return "-"  # 如果未找到，返回空字符串
+class TimeoutException(Exception):
+    pass
+
+# 超时处理函数
+def timeout_handler(signum, frame):
+    raise TimeoutException("Function execution exceeded time limit.")
+
+def svgTopng(svg_text,unsafe=True):
+    # 设置超时处理
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(3)  
+
+    try:
+        png_data = cairosvg.svg2png(bytestring=svg_text)
+        # Create an image from the PNG data
+        image = Image.open(io.BytesIO(png_data))
+        # Create a new image with a light gray background
+        background = Image.new('RGB', image.size, (240, 240, 240))  # Light gray color
+        background.paste(image, (0, 0), image)
+        return background
+    finally:
+        signal.alarm(0)  # 取消超时
 class CustomMistralForCausalLM(MistralForCausalLM):
 
-    def __init__(self, config):
-        super().__init__(config)
-        # Define a 1D convolutional layer
-        # self.clip_linear_layer = nn.Linear(512, 4096)
-        # self.clip_linear_layer = nn.Conv1d(in_channels=4096, out_channels=512, kernel_size=1)
-        self.align_layer= buildMLP(4096,1024,512)
-        # Initialize weights and apply final processing
-        self.post_init()
+    # def __init__(self, config):
+    #     super().__init__(config)
+    #     # Define a 1D convolutional layer
+    #     # self.clip_linear_layer = nn.Linear(512, 4096)
+    #     # self.clip_linear_layer = nn.Conv1d(in_channels=4096, out_channels=512, kernel_size=1)
+    #     self.align_layer= buildMLP(4096,1024,512)
+    #     # Initialize weights and apply final processing
+    #     self.post_init()
 
     def forward(
         self,
@@ -216,27 +257,23 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             filtered_labels = [label for label in labels.tolist()[0] if label != -100]
                 # print("input_ids",print(input_ids))
             svg_text = tokenizer.decode(filtered_labels).replace('</s>',"")
+            new_svg_text = tokenizer.decode(filtered_labels)
 
-            # print("label","svg_text")
+            print("label",new_svg_text)
             # input_id_decode = tokenizer.decode(f_input_ids).replace('</s>',"")
             # print("Input",input_id_decode)
-            png_data = cairosvg.svg2png(bytestring=svg_text)
-            # Create an image from the PNG data
-            image = Image.open(io.BytesIO(png_data))
-            # Create a new image with a light gray background
-            background = Image.new('RGB', image.size, (240, 240, 240))  # Light gray color
-            background.paste(image, (0, 0), image)
-            # 2. 加载并预处理图像
-            image = clip_preprocess(background).unsqueeze(0).to("cuda")
-            # Encode the image to get the image features
-            image_embeddings = clip_model.encode_image(image) 
-#           获得svg last_hidden_state
-            svg_inputs = tokenizer(svg_text, return_tensors="pt").to("cuda")
-            svg_hidden_outputs = self.model(**svg_inputs)
-            svg_hidden_states = svg_hidden_outputs.last_hidden_state
 
-            align_hidden_states=self.align_layer(svg_hidden_states)
-            similarity = cosine_similarity(align_hidden_states,image_embeddings)
+            # 2. 加载并预处理图像
+            image = clip_preprocess(svgTopng(svg_text)).unsqueeze(0).to("cuda")
+            # Encode the image to get the image features
+            label_embeddings = clip_model.encode_image(image) 
+#           获得svg last_hidden_state
+            # svg_inputs = tokenizer(svg_text, return_tensors="pt").to("cuda")
+            # svg_hidden_outputs = self.model(**svg_inputs)
+            # svg_hidden_states = svg_hidden_outputs.last_hidden_state
+
+            # align_hidden_states=self.align_layer(svg_hidden_states)
+            # similarity = cosine_similarity(align_hidden_states,image_embeddings)
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
             shift_logits = logits[..., :-1, :].contiguous()
@@ -247,32 +284,27 @@ class CustomMistralForCausalLM(MistralForCausalLM):
             # Ensure tensors are on the same device
             shift_labels = shift_labels.to(shift_logits.device)
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits, shift_labels)*(1-similarity)
-            # loss = loss_fct(shift_logits, shift_labels)
-            # batch_size, sequence_length, vocab_size = logits.shape
-            # decoded_outputs = []
-            # for i in range(batch_size):
-            #     decoded_sequence = []
-            #     for j in range(sequence_length):
-            #         # 获取当前时间步的 logits
-            #         current_logits = logits[i, j, :]
-                    
-            #         # 获取预测的 token ID
-            #         predicted_token_id = current_logits.argmax(dim=-1)
-                    
-            #         # 解码为文本
-            #         decoded_token = tokenizer.decode(predicted_token_id, skip_special_tokens=True)
-            #         decoded_sequence.append(decoded_token)
-                
-            #     decoded_outputs.append(decoded_sequence)
 
-            # # 打印解码结果
-            # for i, sequence in enumerate(decoded_outputs):
-            #     print(f"Decoded output for batch {i}: {' '.join(sequence)}")
+            predicted_token_ids = logits.argmax(dim=-1)  # 获取整个序列的预测 token IDs
+            decoded_output = tokenizer.decode(predicted_token_ids[0], skip_special_tokens=True)
+            res_svg = get_decoded_svg_content(decoded_output)
+
+            try:
+                print("res_svg",res_svg)
+                # 尝试将 SVG 转换为 PNG
+    
+                res_img = clip_preprocess(svgTopng(res_svg)).unsqueeze(0).to("cuda")
+                res_embeddings = clip_model.encode_image(res_img)
+
+                loss = loss_fct(shift_logits, shift_labels)*0.7 +(1 - cosine_similarity(res_embeddings, label_embeddings))*0.3
+            except Exception as e:
+                print(f"Error : {e}")
+                loss = loss_fct(shift_logits, shift_labels)
+            # loss = loss_fct(shift_logits, shift_labels)
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -285,19 +317,20 @@ def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     print(script_args)
+
     # script_args = TrainingArguments(
     #     model_name_or_path="/home/liuzhe/new-files/AI-ModelScope/Mistral-7B-v0___1",
     #     output_dir="output_32",
     #     lora_r=128,
-    #     data_path="/home/liuzhe/new-files/LoRA-XS/utils/dataset-1024-everypath-9-7.json",
-    #     dataset_split="train[:1]",
+    #     data_path="/home/liuzhe/new-files/LoRA-XS/utils/dataset-1024-everypath-10-26.json",
+    #     dataset_split="train",
     #     dataset_field=['caption', 'code'],
     #     num_train_epochs=4,
     #     per_device_train_batch_size=1,
     #     gradient_accumulation_steps=1,
     #     save_strategy="steps",
     #     save_steps=48,
-    #     save_total_limit=30,
+    #     save_total_limit=20,
     #     learning_rate=4e-3,
     #     weight_decay=0.,
     #     warmup_ratio=0.02,
@@ -306,7 +339,6 @@ def train():
     #     bf16=False,
     #     tf32=False,
     #     fp16=True,
-    #     report_to="tensorboard"
     # )
     set_seed(script_args.seed)
 
@@ -323,6 +355,7 @@ def train():
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)
+
     else:
         raise ValueError("LoRA rank should be provided.")
 
@@ -348,6 +381,18 @@ def train():
 
     find_and_initialize(model, peft_config_dict, adapter_name=adapter_name, reconstr_type=reconstr_type,
                         writer=None, reconstruct_config=reconstr_config)
+    
+
+    # print(model)
+    # for name, module in model.named_modules():
+
+    #     if isinstance(module,peft.tuners.lora.Linear):
+    #     # Check if the module has the clip_conv1d attribute
+    #         if hasattr(module, 'clip_conv1d'):
+    #             clip_conv1d_layer = module.clip_conv1d
+    #             print(f"Found clip_conv1d in module: {name}")
+    #             print(clip_conv1d_layer)
+
     for param in model.parameters():
         param.data = param.data.contiguous()
     model.print_trainable_parameters()
@@ -357,6 +402,7 @@ def train():
         padding_side="right",
         use_fast=True,
     )
+
     tokenizer.pad_token_id = tokenizer.eos_token_id
     raw_train_datasets = load_dataset("json",data_files=script_args.data_path,split='train')
         # remove_columns=raw_train_datasets.column_names,
@@ -372,7 +418,9 @@ def train():
     )
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, data_collator=data_collator)
+    
     trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
+
     model.config.use_cache = False
     trainer.train()
     trainer.save_state()
